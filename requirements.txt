@@ -1,0 +1,11 @@
+quart
+sqlite-vss
+PyPDF2
+python-docx
+pandas
+chardet
+markdown
+beautifulsoup4
+ebooklib
+html2text
+langchain
