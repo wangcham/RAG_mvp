@@ -2,3 +2,4 @@
 /sqlite-vss
 /data
 /app/knowledge_base.db
+/app/db.py
