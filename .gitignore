@@ -1,5 +1,6 @@
 /venv 
 /sqlite-vss
 /data
-/app/knowledge_base.db
 /app/db.py
+/app/rag_database.db
+__pycache__/

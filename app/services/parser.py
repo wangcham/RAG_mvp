@@ -1,255 +1,288 @@
+
 import PyPDF2
 from docx import Document
 import pandas as pd
 import csv
 import chardet
-from typing import Union, List
+from typing import Union, List, Callable, Any
 import logging
 import markdown
 from bs4 import BeautifulSoup
 import ebooklib
 from ebooklib import epub
-from html2text import html2text
 import re
+import asyncio # Import asyncio for async operations
+import os
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 class FileParser:
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        self.logger = logging.getLogger(__name__)
+    """
+    A robust file parser class to extract text content from various document formats.
+    It supports TXT, PDF, DOCX, XLSX, CSV, Markdown, HTML, and EPUB files.
+    All core file reading operations are designed to be run synchronously in a thread pool
+    to avoid blocking the asyncio event loop.
+    """
+    def __init__(self):
+        
+        self.logger = logging.getLogger(self.__class__.__name__)
 
-    async def parse(self) -> str:
-        """根据文件扩展名选择相应的解析方法"""
-        file_extension = self.file_path.split('.')[-1].lower()
+    async def _run_sync(self, sync_func: Callable, *args: Any, **kwargs: Any) -> Any:
+        """
+        Runs a synchronous function in a separate thread to prevent blocking the event loop.
+        This is a general utility method for wrapping blocking I/O operations.
+        """
+        try:
+            return await asyncio.to_thread(sync_func, *args, **kwargs)
+        except Exception as e:
+            self.logger.error(f"Error running synchronous function {sync_func.__name__}: {e}")
+            raise
+
+    async def parse(self, file_path: str) -> Union[str, None]:
+        """
+        Parses the file based on its extension and returns the extracted text content.
+        This is the main asynchronous entry point for parsing.
+        
+        Args:
+            file_path (str): The path to the file to be parsed.
+
+        Returns:
+            Union[str, None]: The extracted text content as a single string, or None if parsing fails.
+        """
+        if not file_path or not os.path.exists(file_path):
+            self.logger.error(f"Invalid file path provided: {file_path}")
+            return None
+
+        file_extension = file_path.split('.')[-1].lower()
         parser_method = getattr(self, f'_parse_{file_extension}', None)
         
         if parser_method is None:
-            await self.logger.error(f"Unsupported file format: {file_extension}")
+            self.logger.error(f"Unsupported file format: {file_extension} for file {file_path}")
             return None
         
-        return await parser_method()
-
-    async def _parse_txt(self) -> str:
         try:
-            # 检测文件编码
-            with open(self.file_path, 'rb') as file:
+            # Pass file_path to the specific parser methods
+            return await parser_method(file_path)
+        except Exception as e:
+            self.logger.error(f"Failed to parse {file_extension} file {file_path}: {e}")
+            return None
+
+    # --- Helper for reading files with encoding detection ---
+    async def _read_file_content(self, file_path: str, mode: str = 'r') -> Union[str, bytes]:
+        """
+        Reads a file with automatic encoding detection, ensuring the synchronous
+        file read operation runs in a separate thread.
+        """
+        def _read_sync():
+            with open(file_path, 'rb') as file:
                 raw_data = file.read()
                 detected = chardet.detect(raw_data)
                 encoding = detected['encoding'] or 'utf-8'
             
-            # 使用检测到的编码读取文件
-            with open(self.file_path, 'r', encoding=encoding) as file:
-                print(file.read())
-                return file.read()
-        except Exception as e:
-            self.logger.error(f"Error parsing TXT file: {str(e)}")
-            raise
-        
-    async def _parse_pdf(self) -> str:
-        try:
+            if mode == 'r':
+                return raw_data.decode(encoding, errors='ignore')
+            return raw_data # For binary mode
+
+        return await self._run_sync(_read_sync)
+
+    # --- Specific Parser Methods ---
+
+    async def _parse_txt(self, file_path: str) -> str:
+        """Parses a TXT file and returns its content."""
+        self.logger.info(f"Parsing TXT file: {file_path}")
+        return await self._read_file_content(file_path, mode='r')
+
+    async def _parse_pdf(self, file_path: str) -> str:
+        """Parses a PDF file and returns its text content."""
+        self.logger.info(f"Parsing PDF file: {file_path}")
+        def _parse_pdf_sync():
             text_content = []
-            with open(self.file_path, 'rb') as file:
+            with open(file_path, 'rb') as file:
                 pdf_reader = PyPDF2.PdfReader(file)
                 for page in pdf_reader.pages:
-                    text_content.append(page.extract_text())
+                    text = page.extract_text()
+                    if text:
+                        text_content.append(text)
             return '\n'.join(text_content)
-        except Exception as e:
-            self.logger.error(f"Error parsing PDF file: {str(e)}")
-            raise
-        
-    async def _parse_docx(self) -> str:
-        try:
-            doc = Document(self.file_path)
-            text_content = []
-            for paragraph in doc.paragraphs:
-                text_content.append(paragraph.text)
+        return await self._run_sync(_parse_pdf_sync)
+
+    async def _parse_docx(self, file_path: str) -> str:
+        """Parses a DOCX file and returns its text content."""
+        self.logger.info(f"Parsing DOCX file: {file_path}")
+        def _parse_docx_sync():
+            doc = Document(file_path)
+            text_content = [paragraph.text for paragraph in doc.paragraphs if paragraph.text.strip()]
             return '\n'.join(text_content)
-        except Exception as e:
-            self.logger.error(f"Error parsing DOCX file: {str(e)}")
-            raise
+        return await self._run_sync(_parse_docx_sync)
     
-    async def _parse_doc(self) -> str:
-        # 注意：.doc 文件需要使用其他库，如 antiword 或 textract
-        # 这里建议将 .doc 转换为 .docx 后再处理
-        self.logger.warning("Direct .doc parsing not supported. Please convert to .docx first.")
+    async def _parse_doc(self, file_path: str) -> str:
+        """Handles .doc files, explicitly stating lack of direct support."""
+        self.logger.warning(f"Direct .doc parsing is not supported for {file_path}. Please convert to .docx first.")
         raise NotImplementedError("Direct .doc parsing not supported. Please convert to .docx first.")
         
-    async def _parse_xlsx(self) -> Union[str, List[str]]:
-        try:
-            # 读取所有工作表
-            excel_file = pd.ExcelFile(self.file_path)
-            text_content = []
-            
+    async def _parse_xlsx(self, file_path: str) -> str:
+        """Parses an XLSX file, returning text from all sheets."""
+        self.logger.info(f"Parsing XLSX file: {file_path}")
+        def _parse_xlsx_sync():
+            excel_file = pd.ExcelFile(file_path)
+            all_sheet_content = []
             for sheet_name in excel_file.sheet_names:
-                df = pd.read_excel(self.file_path, sheet_name=sheet_name)
-                # 将 DataFrame 转换为字符串
-                sheet_text = f"Sheet: {sheet_name}\n{df.to_string()}"
-                text_content.append(sheet_text)
-            
-            return '\n\n'.join(text_content)
-        except Exception as e:
-            self.logger.error(f"Error parsing XLSX file: {str(e)}")
-            raise
+                df = pd.read_excel(file_path, sheet_name=sheet_name)
+                sheet_text = f"--- Sheet: {sheet_name} ---\n{df.to_string(index=False)}\n"
+                all_sheet_content.append(sheet_text)
+            return '\n'.join(all_sheet_content)
+        return await self._run_sync(_parse_xlsx_sync)
         
-    async def _parse_csv(self) -> str:
-        try:
-            # 检测文件编码
-            with open(self.file_path, 'rb') as file:
-                raw_data = file.read()
-                detected = chardet.detect(raw_data)
-                encoding = detected['encoding'] or 'utf-8'
-            
-            # 读取 CSV 文件
-            df = pd.read_csv(self.file_path, encoding=encoding)
-            return df.to_string()
-        except Exception as e:
-            self.logger.error(f"Error parsing CSV file: {str(e)}")
-            raise
+    async def _parse_csv(self, file_path: str) -> str:
+        """Parses a CSV file and returns its content as a string."""
+        self.logger.info(f"Parsing CSV file: {file_path}")
+        def _parse_csv_sync():
+            # pd.read_csv can often detect encoding, but explicit detection is safer
+            raw_data = self._read_file_content(file_path, mode='rb') # Note: this will need to be await outside this sync function
+            # For simplicity, we'll let pandas handle encoding internally after a raw read.
+            # A more robust solution might pass encoding directly to pd.read_csv after detection.
+            detected = chardet.detect(open(file_path, 'rb').read())
+            encoding = detected['encoding'] or 'utf-8'
+            df = pd.read_csv(file_path, encoding=encoding)
+            return df.to_string(index=False)
+        return await self._run_sync(_parse_csv_sync)
     
-    async def _parse_markdown(self) -> str:
-        try:
-            # 检测文件编码
-            with open(self.file_path, 'rb') as file:
-                raw_data = file.read()
-                detected = chardet.detect(raw_data)
-                encoding = detected['encoding'] or 'utf-8'
-            
-            # 读取 Markdown 文件
-            with open(self.file_path, 'r', encoding=encoding) as file:
-                md_content = file.read()
-            
-            # 将 Markdown 转换为 HTML
+    async def _parse_markdown(self, file_path: str) -> str:
+        """Parses a Markdown file, converting it to structured plain text."""
+        self.logger.info(f"Parsing Markdown file: {file_path}")
+        def _parse_markdown_sync():
+            md_content = self._read_file_content(file_path, mode='r') # This is a synchronous call within a sync function
             html_content = markdown.markdown(
                 md_content,
-                extensions=['extra', 'codehilite', 'tables', 'toc']
+                extensions=['extra', 'codehilite', 'tables', 'toc', 'fenced_code']
             )
-            
-            # 使用 BeautifulSoup 清理 HTML
             soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # 提取文本，保留基本结构
-            text_content = []
-            for element in soup.stripped_strings:
-                # 保留标题的层级结构
-                if element.parent.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                    level = int(element.parent.name[1])
-                    text_content.append('#' * level + ' ' + element)
-                # 保留列表结构
-                elif element.parent.name in ['ul', 'ol']:
-                    text_content.append('* ' + element)
-                # 保留代码块
-                elif element.parent.name == 'pre':
-                    text_content.append('```\n' + element + '\n```')
-                else:
-                    text_content.append(element)
-            
-            return '\n'.join(text_content)
-        except Exception as e:
-            self.logger.error(f"Error parsing Markdown file: {str(e)}")
-            raise
+            text_parts = []
+            for element in soup.children:
+                if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                    level = int(element.name[1])
+                    text_parts.append('#' * level + ' ' + element.get_text().strip())
+                elif element.name == 'p':
+                    text = element.get_text().strip()
+                    if text:
+                        text_parts.append(text)
+                elif element.name in ['ul', 'ol']:
+                    for li in element.find_all('li'):
+                        text_parts.append(f"* {li.get_text().strip()}")
+                elif element.name == 'pre':
+                    code_block = element.get_text().strip()
+                    if code_block:
+                        text_parts.append(f"```\n{code_block}\n```")
+                elif element.name == 'table':
+                    table_str = self._extract_table_to_markdown_sync(element) # Call sync helper
+                    if table_str:
+                        text_parts.append(table_str)
+                elif element.name:
+                    text = element.get_text(separator=' ', strip=True)
+                    if text:
+                        text_parts.append(text)
+            cleaned_text = re.sub(r'\n\s*\n', '\n\n', '\n'.join(text_parts))
+            return cleaned_text.strip()
+        return await self._run_sync(_parse_markdown_sync)
 
-    async def _parse_html(self) -> str:
-        try:
-            # 检测文件编码
-            with open(self.file_path, 'rb') as file:
-                raw_data = file.read()
-                detected = chardet.detect(raw_data)
-                encoding = detected['encoding'] or 'utf-8'
-            
-            # 读取 HTML 文件
-            with open(self.file_path, 'r', encoding=encoding) as file:
-                html_content = file.read()
-            
-            # 使用 BeautifulSoup 解析 HTML
+    async def _parse_html(self, file_path: str) -> str:
+        """Parses an HTML file, extracting structured plain text."""
+        self.logger.info(f"Parsing HTML file: {file_path}")
+        def _parse_html_sync():
+            html_content = self._read_file_content(file_path, mode='r') # Sync call within sync function
             soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # 移除脚本和样式元素
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            # 提取文本，保留基本结构
-            text_content = []
-            
-            # 处理标题
-            for heading in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-                level = int(heading.name[1])
-                text_content.append('#' * level + ' ' + heading.get_text().strip())
-            
-            # 处理段落
-            for p in soup.find_all('p'):
-                text = p.get_text().strip()
-                if text:
-                    text_content.append(text)
-            
-            # 处理列表
-            for ul in soup.find_all(['ul', 'ol']):
-                for li in ul.find_all('li'):
-                    text_content.append('* ' + li.get_text().strip())
-            
-            # 处理表格
-            for table in soup.find_all('table'):
-                # 提取表头
-                headers = [th.get_text().strip() for th in table.find_all('th')]
-                if headers:
-                    text_content.append(' | '.join(headers))
-                    text_content.append(' | '.join(['---'] * len(headers)))
-                
-                # 提取表格内容
-                for row in table.find_all('tr'):
-                    cells = [td.get_text().strip() for td in row.find_all('td')]
-                    if cells:
-                        text_content.append(' | '.join(cells))
-            
-            return '\n'.join(text_content)
-        except Exception as e:
-            self.logger.error(f"Error parsing HTML file: {str(e)}")
-            raise
+            for script_or_style in soup(["script", "style"]):
+                script_or_style.decompose()
+            text_parts = []
+            for element in soup.body.children if soup.body else soup.children:
+                if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                    level = int(element.name[1])
+                    text_parts.append('#' * level + ' ' + element.get_text().strip())
+                elif element.name == 'p':
+                    text = element.get_text().strip()
+                    if text:
+                        text_parts.append(text)
+                elif element.name in ['ul', 'ol']:
+                    for li in element.find_all('li'):
+                        text = li.get_text().strip()
+                        if text:
+                            text_parts.append(f"* {text}")
+                elif element.name == 'table':
+                    table_str = self._extract_table_to_markdown_sync(element) # Call sync helper
+                    if table_str:
+                        text_parts.append(table_str)
+                elif element.name:
+                    text = element.get_text(separator=' ', strip=True)
+                    if text:
+                        text_parts.append(text)
+            cleaned_text = re.sub(r'\n\s*\n', '\n\n', '\n'.join(text_parts))
+            return cleaned_text.strip()
+        return await self._run_sync(_parse_html_sync)
     
-    async def _parse_epub(self) -> str:
-        try:
-            # 读取 EPUB 文件
-            book = epub.read_epub(self.file_path)
-            
+    async def _parse_epub(self, file_path: str) -> str:
+        """Parses an EPUB file, extracting metadata and content."""
+        self.logger.info(f"Parsing EPUB file: {file_path}")
+        def _parse_epub_sync():
+            book = epub.read_epub(file_path)
             text_content = []
-            
-            # 提取元数据
-            metadata = book.get_metadata('DC', 'title')
-            if metadata:
-                text_content.append(f"Title: {metadata[0][0]}")
-            
-            # 提取目录
+            title_meta = book.get_metadata('DC', 'title')
+            if title_meta:
+                text_content.append(f"Title: {title_meta[0][0]}")
+            creator_meta = book.get_metadata('DC', 'creator')
+            if creator_meta:
+                text_content.append(f"Author: {creator_meta[0][0]}")
+            date_meta = book.get_metadata('DC', 'date')
+            if date_meta:
+                text_content.append(f"Publish Date: {date_meta[0][0]}")
             toc = book.get_toc()
             if toc:
-                text_content.append("\nTable of Contents:")
-                for item in toc:
-                    if isinstance(item, tuple):
-                        # 处理嵌套目录
-                        chapter, subchapters = item
-                        text_content.append(f"- {chapter.title}")
-                        for subchapter in subchapters:
-                            text_content.append(f"  - {subchapter.title}")
-                    else:
-                        text_content.append(f"- {item.title}")
-            
-            # 提取正文内容
+                text_content.append("\n--- Table of Contents ---")
+                self._add_toc_items_sync(toc, text_content, level=0) # Call sync helper
+                text_content.append("--- End of Table of Contents ---\n")
             for item in book.get_items():
                 if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                    # 将 HTML 内容转换为文本
-                    html_content = item.get_content().decode('utf-8')
+                    html_content = item.get_content().decode('utf-8', errors='ignore')
                     soup = BeautifulSoup(html_content, 'html.parser')
-                    
-                    # 移除脚本和样式元素
-                    for script in soup(["script", "style"]):
-                        script.decompose()
-                    
-                    # 提取文本
+                    for junk in soup(["script", "style", "nav", "header", "footer"]):
+                        junk.decompose()
                     text = soup.get_text(separator='\n', strip=True)
-                    # 清理多余的空白行
                     text = re.sub(r'\n\s*\n', '\n\n', text)
-                    text_content.append(text)
-            
-            return '\n\n'.join(text_content)
-        except Exception as e:
-            self.logger.error(f"Error parsing EPUB file: {str(e)}")
-            raise
+                    if text:
+                        text_content.append(text)
+            return re.sub(r'\n\s*\n', '\n\n', '\n'.join(text_content)).strip()
+        return await self._run_sync(_parse_epub_sync)
 
+    def _add_toc_items_sync(self, toc_list: list, text_content: list, level: int):
+        """Recursively adds TOC items to text_content (synchronous helper)."""
+        indent = '  ' * level
+        for item in toc_list:
+            if isinstance(item, tuple):
+                chapter, subchapters = item
+                text_content.append(f"{indent}- {chapter.title}")
+                self._add_toc_items_sync(subchapters, text_content, level + 1)
+            else:
+                text_content.append(f"{indent}- {item.title}")
 
+    def _extract_table_to_markdown_sync(self, table_element: BeautifulSoup) -> str:
+        """Helper to convert a BeautifulSoup table element into a Markdown table string (synchronous)."""
+        headers = [th.get_text().strip() for th in table_element.find_all('th')]
+        rows = []
+        for tr in table_element.find_all('tr'):
+            cells = [td.get_text().strip() for td in tr.find_all('td')]
+            if cells:
+                rows.append(cells)
+        
+        if not headers and not rows:
+            return ""
+
+        table_lines = []
+        if headers:
+            table_lines.append(' | '.join(headers))
+            table_lines.append(' | '.join(['---'] * len(headers)))
+        
+        for row_cells in rows:
+            padded_cells = row_cells + [''] * (len(headers) - len(row_cells)) if headers else row_cells
+            table_lines.append(' | '.join(padded_cells))
+        
+        return '\n'.join(table_lines)

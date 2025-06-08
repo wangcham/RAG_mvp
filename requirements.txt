@@ -1,5 +1,4 @@
 quart
-sqlite-vss
 PyPDF2
 python-docx
 pandas
@@ -9,3 +8,6 @@ beautifulsoup4
 ebooklib
 html2text
 langchain
+faiss-cpu
+sqlalchemy
+sentence_transformers
