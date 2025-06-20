@@ -180,7 +180,7 @@ EMBEDDING_MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     "bge-m3": { # Example for a third-party API model
         "type": "third_party_api",
         "model_name": "bge-m3",
-        "api_endpoint": "https://api.qhaigc.net",
+        "api_endpoint": "https://api.qhaigc.net/v1/embeddings",
         "headers": {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {os.getenv('rag_api_key')}"
@@ -189,7 +189,7 @@ EMBEDDING_MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
             "model": "bge-m3",
             "input": ""
         },
-        "embedding_dimension": 768 
+        "embedding_dimension": 1024
     },
     "OpenAI-Ada-002": {
         "type": "third_party_api",

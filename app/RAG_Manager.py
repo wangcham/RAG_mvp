@@ -1,3 +1,4 @@
+# RAG_Manager class (main class, adjust imports as needed)
 import logging
 import os
 import asyncio
@@ -5,9 +6,9 @@ from services.parser import FileParser
 from services.chunker import Chunker
 from services.embedder import Embedder
 from services.retriever import Retriever
-from services.database import create_db_and_tables, SessionLocal, KnowledgeBase, File
-from services.faiss_manager import FAISSIndexManager
-from services.embedding_models import ThirdPartyAPIEmbeddingModel, EMBEDDING_MODEL_CONFIGS
+from services.database import create_db_and_tables, SessionLocal, KnowledgeBase, File, Chunk # Ensure Chunk is imported if you need to manipulate it directly
+from services.embedding_models import EmbeddingModelFactory
+from services.chroma_manager import ChromaIndexManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
@@ -20,75 +21,53 @@ class RAG_Manager:
         self.embedding_model_type = embedding_model_type
         self.embedding_model_name = embedding_model_name
 
-        # 定位嵌入模型
         try:
-            dummy_model = ThirdPartyAPIEmbeddingModel(
-                model_name=self.embedding_model_name,
-                api_endpoint=EMBEDDING_MODEL_CONFIGS[self.embedding_model_name]['api_endpoint'],
-                headers=EMBEDDING_MODEL_CONFIGS[self.embedding_model_name]['headers'],
-                payload_template=EMBEDDING_MODEL_CONFIGS[self.embedding_model_name]['payload_template'],
-                embedding_dimension=EMBEDDING_MODEL_CONFIGS[self.embedding_model_name]['embedding_dimension']
+            model = EmbeddingModelFactory.create_model(
+                model_type=self.embedding_model_type,
+                model_name_key=self.embedding_model_name
             )
-            self.expected_embedding_dim = dummy_model._embedding_dimension
-            self.logger.info(f"Configured embedding model '{self.embedding_model_name}' has dimension: {self.expected_embedding_dim}")
+            self.logger.info(f"Configured embedding model '{self.embedding_model_name}' has dimension: {model.embedding_dimension}")
         except Exception as e:
             self.logger.critical(f"Failed to get dimension for configured embedding model '{self.embedding_model_name}': {e}")
             raise RuntimeError("Failed to initialize RAG_Manager due to embedding model issues.")
 
-        # faiss索引
-        self.faiss_manager = FAISSIndexManager(self.expected_embedding_dim)
+
+        self.chroma_manager = ChromaIndexManager(collection_name=f"rag_collection_{self.embedding_model_name.replace('-', '_')}")
 
         self.parser = FileParser()
         self.chunker = Chunker()
-        
-        # 定位嵌入器和检索器，但是后续需要确保模型一致
-        self.embedder = Embedder(model_type=self.embedding_model_type,
-                                 model_name_key=self.embedding_model_name,
-                                 faiss_manager=self.faiss_manager)
-        self.retriever = Retriever(model_type=self.embedding_model_type,
-                                  model_name_key=self.embedding_model_name,
-                                  faiss_manager=self.faiss_manager)
+        # Pass chroma_manager to Embedder and Retriever
+        self.embedder = Embedder(
+            model_type=self.embedding_model_type,
+            model_name_key=self.embedding_model_name,
+            chroma_manager=self.chroma_manager # Inject dependency
+        )
+        self.retriever = Retriever(
+            model_type=self.embedding_model_type,
+            model_name_key=self.embedding_model_name,
+            chroma_manager=self.chroma_manager # Inject dependency
+        )
 
     async def initialize_system(self):
-        # 启动！
-        """Initializes database tables and loads FAISS index."""
-        self.logger.info("Initializing database and FAISS index...")
+        self.logger.info("Initializing database and Chroma index...")
         await asyncio.to_thread(create_db_and_tables)
-
-        
-        await asyncio.to_thread(self.faiss_manager.load_from_db_sync)
-
-        if self.faiss_manager.embedding_dim != self.expected_embedding_dim:
-            self.logger.critical(
-                f"FATAL: FAISS index dimension ({self.faiss_manager.embedding_dim}) "
-                f"does not match configured embedding model dimension ({self.expected_embedding_dim}). "
-                "This means vectors in your database were created with a different model. "
-                "You must either clear your database (vectors table) or switch to the correct model."
-            )
-            raise ValueError("FAISS index dimension mismatch with configured embedding model.")
-
+        # Chroma collection is implicitly created on first access within ChromaIndexManager
         self.logger.info("System initialization complete.")
 
     async def store_data(self, file_path: str, kb_name: str, file_type: str, kb_description: str = "Default knowledge base"):
-        """
-        存储数据：解析文件 -> 分块 -> 嵌入并存储。
-        """
         self.logger.info(f"Starting data storage process for file: {file_path}")
         try:
-            # 内部同步函数：获取知识库
             def _get_kb_sync(name):
-                session = SessionLocal() # 在新线程中创建会话
+                session = SessionLocal()
                 try:
                     return session.query(KnowledgeBase).filter_by(name=name).first()
                 finally:
-                    session.close() # 确保会话关闭
-            
-            # 在单独的线程中运行同步的数据库查询
+                    session.close()
+
             kb = await asyncio.to_thread(_get_kb_sync, kb_name)
 
             if not kb:
                 self.logger.info(f"Knowledge Base '{kb_name}' not found. Creating a new one.")
-                # 内部同步函数：添加知识库
                 def _add_kb_sync():
                     session = SessionLocal()
                     try:
@@ -102,7 +81,6 @@ class RAG_Manager:
                 kb = await asyncio.to_thread(_add_kb_sync)
                 self.logger.info(f"Created Knowledge Base: {kb.name} (ID: {kb.id})")
 
-            # 内部同步函数：添加文件
             def _add_file_sync(kb_id, file_name, path, file_type):
                 session = SessionLocal()
                 try:
@@ -114,31 +92,37 @@ class RAG_Manager:
                 finally:
                     session.close()
 
-            # 在单独的线程中运行同步的数据库操作
             file_obj = await asyncio.to_thread(_add_file_sync, kb.id, os.path.basename(file_path), file_path, file_type)
             self.logger.info(f"Added file entry: {file_obj.file_name} (ID: {file_obj.id})")
 
-            # 文件解析 
             text = await self.parser.parse(file_path)
             if not text:
                 self.logger.warning(f"File {file_path} parsed to empty content. Skipping chunking and embedding.")
+                # You might want to delete the file_obj from the DB here if it's empty.
+                session = SessionLocal()
+                try:
+                    session.delete(file_obj)
+                    session.commit()
+                except Exception as del_e:
+                    self.logger.error(f"Failed to delete empty file_obj {file_obj.id}: {del_e}")
+                finally:
+                    session.close()
                 return
 
-            chunks = await self.chunker.chunk(text)
-            self.logger.info(f"Chunked into {len(chunks)} pieces.")
+            chunks_texts = await self.chunker.chunk(text)
+            self.logger.info(f"Chunked into {len(chunks_texts)} pieces.")
 
-            await self.embedder.embed_and_store(file_id=file_obj.id, chunks=chunks)
+            # embed_and_store now handles both DB chunk saving and Chroma embedding
+            await self.embedder.embed_and_store(file_id=file_obj.id, chunks=chunks_texts)
 
             self.logger.info(f"Data storage process completed for file: {file_path}")
 
         except Exception as e:
             self.logger.error(f"Error in store_data for file {file_path}: {str(e)}", exc_info=True)
+            # Consider cleaning up partially stored data if an error occurs.
             return
 
     async def retrieve_data(self, query: str):
-        """
-        检索过程：嵌入查询 -> 检索相关分块。
-        """
         self.logger.info(f"Starting data retrieval process for query: '{query}'")
         try:
             retrieved_chunks = await self.retriever.retrieve(query)
@@ -148,32 +132,91 @@ class RAG_Manager:
             self.logger.error(f"Error in retrieve_data for query '{query}': {str(e)}", exc_info=True)
             return []
 
-# 测试你的
+    async def delete_data_by_file_id(self, file_id: int):
+        """
+        Deletes data associated with a specific file_id from both the relational DB and Chroma.
+        """
+        self.logger.info(f"Starting data deletion process for file_id: {file_id}")
+        session = SessionLocal()
+        try:
+            # 1. Delete from Chroma
+            await asyncio.to_thread(self.chroma_manager.delete_by_file_id_sync, file_id)
+
+            # 2. Delete chunks from relational DB
+            chunks_to_delete = session.query(Chunk).filter_by(file_id=file_id).all()
+            for chunk in chunks_to_delete:
+                session.delete(chunk)
+            self.logger.info(f"Deleted {len(chunks_to_delete)} chunks from relational DB for file_id: {file_id}.")
+
+            # 3. Delete file entry from relational DB
+            file_to_delete = session.query(File).filter_by(id=file_id).first()
+            if file_to_delete:
+                session.delete(file_to_delete)
+                self.logger.info(f"Deleted file entry {file_id} from relational DB.")
+            else:
+                self.logger.warning(f"File entry {file_id} not found in relational DB.")
+
+            session.commit()
+            self.logger.info(f"Data deletion completed for file_id: {file_id}.")
+        except Exception as e:
+            session.rollback()
+            self.logger.error(f"Error deleting data for file_id {file_id}: {str(e)}", exc_info=True)
+        finally:
+            session.close()
+
+
+# 测试用入口
 async def main_run_standalone():
-    rag_manager_minilm = RAG_Manager(
+    rag_manager = RAG_Manager(
         embedding_model_type="third_party_api",
         embedding_model_name="bge-m3"
     )
-    await rag_manager_minilm.initialize_system()
+    await rag_manager.initialize_system()
 
-    dummy_file_path_minilm = "test_document_minilm.txt"
-    with open(dummy_file_path_minilm, "w", encoding="utf-8") as f:
-        f.write("This is a document for MiniLM. It talks about efficient NLP models,such as bgm-m3. It is a good starting point for learning about embeddings.")
-    await rag_manager_minilm.store_data(
-        file_path=dummy_file_path_minilm,
-        kb_name="KB",
-        file_type="txt"
+    test_file = "test_document_minilm.txt"
+    file_content = "This is a document for MiniLM. It talks about efficient NLP models, such as bge-m3. It is a good starting point for learning about embeddings. This document provides more context on the topic of language models and their applications in various fields."
+    with open(test_file, "w", encoding="utf-8") as f:
+        f.write(file_content)
+
+    print("\n--- Storing Data ---")
+    await rag_manager.store_data(
+        file_path=test_file,
+        kb_name="KB_NLP_Models",
+        file_type="txt",
+        kb_description="Knowledge Base about NLP models"
     )
-    query_minilm = "What are efficient NLP models?"
-    results_minilm = await rag_manager_minilm.retrieve_data(query_minilm)
-    print(f"\n--- Retrieval Results for Query: '{query_minilm}' (MiniLM) ---")
-    for r in results_minilm:
-        print(f"  Chunk ID: {r['chunk_id']}, Distance: {r['distance']:.4f}, Text: {r['text'][:100]}...")
-    if os.path.exists(dummy_file_path_minilm):
-        os.remove(dummy_file_path_minilm)
+
+    query = "What are efficient NLP models and their applications?"
+    print(f"\n--- Retrieving Data for Query: '{query}' ---")
+    results = await rag_manager.retrieve_data(query)
+    print(f"\n--- Retrieval Results for Query: '{query}' ---")
+    if results:
+        for r in results:
+            print(f"  Chunk ID: {r['chunk_id']}, File ID: {r.get('file_id')}, Distance: {r['distance']:.4f}, Text: {r['text'][:100]}...")
+    else:
+        print("No results found.")
+
+    # Optional: Test deletion
+    # Get the file_id of the test file to delete it
+    session = SessionLocal()
+    file_obj_to_delete = session.query(File).filter_by(file_name=os.path.basename(test_file)).first()
+    session.close()
+
+    if file_obj_to_delete:
+        print(f"\n--- Deleting Data for File ID: {file_obj_to_delete.id} ---")
+        await rag_manager.delete_data_by_file_id(file_obj_to_delete.id)
+        # Verify deletion by trying to retrieve again (should return empty)
+        print(f"\n--- Re-retrieving after deletion for Query: '{query}' ---")
+        results_after_delete = await rag_manager.retrieve_data(query)
+        if not results_after_delete:
+            print("Successfully deleted data. No results found after deletion.")
+        else:
+            print("Deletion might have failed. Results still found.")
+
+    if os.path.exists(test_file):
+        os.remove(test_file)
 
     print("\n" + "="*50 + "\n")
-
 
 if __name__ == "__main__":
     asyncio.run(main_run_standalone())

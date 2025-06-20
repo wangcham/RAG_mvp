@@ -18,18 +18,8 @@ async def startup():
     global rag_manager
     logger.info("Quart app startup initiated.")
     try:
-        model_type_to_use = os.getenv("EMBEDDING_MODEL_TYPE", DEFAULT_EMBEDDING_MODEL_TYPE)
-        model_name_to_use = os.getenv("EMBEDDING_MODEL_NAME", DEFAULT_EMBEDDING_MODEL_NAME)
-
-        # Validate configuration
-        if model_name_to_use not in EMBEDDING_MODEL_CONFIGS or \
-           EMBEDDING_MODEL_CONFIGS[model_name_to_use]["type"] != model_type_to_use:
-            logger.warning(
-                f"Configured EMBEDDING_MODEL_TYPE/NAME ('{model_type_to_use}/{model_name_to_use}') "
-                "is not a valid combination in EMBEDDING_MODEL_CONFIGS. Falling back to defaults."
-            )
-            model_type_to_use = DEFAULT_EMBEDDING_MODEL_TYPE
-            model_name_to_use = DEFAULT_EMBEDDING_MODEL_NAME
+        model_type_to_use = 'third_party_api'  # Default model type
+        model_name_to_use = 'bge-m3'  # Default model name
 
         rag_manager = RAG_Manager(embedding_model_type=model_type_to_use,
                                  embedding_model_name=model_name_to_use)

@@ -1,6 +1,3 @@
-# 数据库操作
-
-# services/database.py
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, LargeBinary
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
@@ -57,4 +54,4 @@ def create_db_and_tables():
     print("Database tables created/checked.")
 
 # 定义嵌入维度（请根据你实际使用的模型调整）
-EMBEDDING_DIM = 768 # 例如：BERT-base是768，OpenAI ada-002是1536
+EMBEDDING_DIM = 1024
